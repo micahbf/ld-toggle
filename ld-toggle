@@ -79,8 +79,9 @@ class LDToggle
 
     # Prompt for project key if not set
     if @project_key.nil? || @project_key.empty?
-      print "Enter LaunchDarkly project key: "
+      print "Enter LaunchDarkly project key (press enter for 'default'): "
       @project_key = gets.chomp
+      @project_key = 'default' if @project_key.empty?
       @config['project_key'] = @project_key
       save_config
     end

@@ -1,0 +1,8 @@
+# Temporary files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Config file (contains sensitive context info)
+.ld-toggle-config

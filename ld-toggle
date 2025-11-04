@@ -1,0 +1,590 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'json'
+require 'optparse'
+require 'fileutils'
+
+# ld-toggle: CLI utility for toggling LaunchDarkly feature flags
+class LDToggle
+  CONFIG_DIR = ENV['XDG_CONFIG_HOME'] || File.expand_path('~/.config')
+  CONFIG_FILE = File.join(CONFIG_DIR, 'ld-toggle', 'config.json')
+
+  def initialize
+    @options = {
+      env: 'development',
+      project: nil,
+      reconfigure: false
+    }
+    parse_arguments
+    @config = load_config
+    @project_key = @options[:project] || @config['project_key']
+    @environment = @options[:env]
+  end
+
+  def run
+    validate_setup
+    ensure_context_configured
+    show_flag_selector
+  end
+
+  private
+
+  def parse_arguments
+    OptionParser.new do |opts|
+      opts.banner = "Usage: ld-toggle [options]"
+
+      opts.on("--env ENVIRONMENT", "Environment (development, staging, production). Default: development") do |env|
+        @options[:env] = env
+      end
+
+      opts.on("--project PROJECT_KEY", "Override default project key") do |project|
+        @options[:project] = project
+      end
+
+      opts.on("--reconfigure", "Reconfigure context for current environment") do
+        @options[:reconfigure] = true
+      end
+
+      opts.on("-h", "--help", "Show this help message") do
+        puts opts
+        exit
+      end
+    end.parse!
+  end
+
+  def load_config
+    return {} unless File.exist?(CONFIG_FILE)
+    JSON.parse(File.read(CONFIG_FILE))
+  rescue JSON::ParserError
+    puts "Warning: Invalid config file, starting fresh"
+    {}
+  end
+
+  def save_config
+    FileUtils.mkdir_p(File.dirname(CONFIG_FILE))
+    File.write(CONFIG_FILE, JSON.pretty_generate(@config))
+  end
+
+  def validate_setup
+    # Check if ldcli is available
+    unless system('which ldcli > /dev/null 2>&1')
+      abort "Error: ldcli not found. Please install it first."
+    end
+
+    # Check if fzf is available
+    unless system('which fzf > /dev/null 2>&1')
+      abort "Error: fzf not found. Please install it first."
+    end
+
+    # Prompt for project key if not set
+    if @project_key.nil? || @project_key.empty?
+      print "Enter LaunchDarkly project key: "
+      @project_key = gets.chomp
+      @config['project_key'] = @project_key
+      save_config
+    end
+  end
+
+  def ensure_context_configured
+    @config['contexts'] ||= {}
+
+    if @options[:reconfigure] || !@config['contexts'][@environment]
+      configure_context
+    end
+
+    # Handle both old format (string) and new format (hash with key/kind)
+    context_config = @config['contexts'][@environment]
+    if context_config.is_a?(String)
+      @context_key = context_config
+      @context_kind = 'user'
+    elsif context_config.is_a?(Hash)
+      @context_key = context_config['key']
+      @context_kind = context_config['kind'] || 'user'
+    else
+      configure_context
+      return
+    end
+
+    if @context_key.nil? || @context_key.empty?
+      configure_context
+    end
+  end
+
+  def configure_context
+    print "Enter user email to search: "
+    email = gets.chomp.strip
+
+    puts "Searching for users with email: #{email}..."
+
+    # Use LaunchDarkly's kind.attribute filter syntax
+    matching_contexts = search_contexts_by_email(email)
+
+    if matching_contexts.empty?
+      puts "No users found with email: #{email}"
+      print "Would you like to enter the context key directly? (y/n): "
+      if gets.chomp.downcase == 'y'
+        configure_context_by_key
+        return
+      else
+        abort "Context configuration cancelled"
+      end
+    end
+
+    # If multiple results, let user choose
+    if matching_contexts.length == 1
+      selected = matching_contexts[0]
+      context_key = selected.dig('context', 'key')
+      context_email = selected.dig('context', 'email')
+      puts "Found user: #{context_key} (#{context_email})"
+    else
+      puts "\nFound #{matching_contexts.length} users:"
+      matching_contexts.each_with_index do |ctx, idx|
+        key = ctx.dig('context', 'key')
+        email = ctx.dig('context', 'email')
+        kind = ctx.dig('context', 'kind')
+        puts "  #{idx + 1}. #{key} (#{email}, kind: #{kind})"
+      end
+      print "\nSelect user (1-#{matching_contexts.length}): "
+      selection = gets.chomp.to_i - 1
+
+      if selection < 0 || selection >= matching_contexts.length
+        abort "Invalid selection"
+      end
+
+      selected = matching_contexts[selection]
+      context_key = selected.dig('context', 'key')
+    end
+
+    @context_key = context_key
+    @context_kind = selected.dig('context', 'kind') || 'user'
+    @config['contexts'] ||= {}
+    @config['contexts'][@environment] = {
+      'key' => @context_key,
+      'kind' => @context_kind
+    }
+    save_config
+
+    puts "Context configured: #{@context_key} (kind: #{@context_kind}) for #{@environment}"
+  end
+
+  def configure_context_by_key
+    print "Enter context key (e.g., auth0|...): "
+    key = gets.chomp.strip
+
+    print "Enter context kind (default: user): "
+    kind = gets.chomp.strip
+    kind = 'user' if kind.empty?
+
+    # Verify the context exists
+    result = run_ldcli_json(
+      'contexts', 'list',
+      '--project', @project_key,
+      '--environment', @environment,
+      '--kind', kind,
+      '--key', key,
+      '--output', 'json'
+    )
+
+    if result.nil? || result['items'].nil? || result['items'].empty?
+      puts "Warning: Could not verify context exists, but saving anyway..."
+    else
+      puts "Context found!"
+    end
+
+    @context_key = key
+    @context_kind = kind
+    @config['contexts'] ||= {}
+    @config['contexts'][@environment] = {
+      'key' => @context_key,
+      'kind' => @context_kind
+    }
+    save_config
+
+    puts "Context configured: #{@context_key} (kind: #{@context_kind}) for #{@environment}"
+  end
+
+  def search_contexts_by_email(email)
+    # Use LaunchDarkly's kind.attribute filter syntax
+    # Format: user.email equals "email@example.com"
+    search_data = {
+      'filter' => "user.email equals \"#{email}\"",
+      'limit' => 50
+    }
+
+    result = run_ldcli_json(
+      'contexts', 'search',
+      '--project', @project_key,
+      '--environment', @environment,
+      '--data', search_data.to_json
+    )
+
+    return [] if result.nil? || result['items'].nil?
+
+    result['items']
+  end
+
+  def show_flag_selector
+    puts "Loading feature flags..."
+
+    flags = fetch_flags
+
+    if flags.empty?
+      puts "No boolean feature flags found."
+      return
+    end
+
+    # Prepare fzf input with flag information and preview data
+    # Since we fetched flags with --env, they already include environment details
+    flag_data = flags.map do |flag|
+      user_value = get_flag_value_for_context_from_flag(flag)
+      default_value = get_default_value_from_flag(flag)
+
+      user_status = user_value.nil? ? "default" : (user_value ? "true" : "false")
+      default_status = default_value ? "true" : "false"
+
+      # Determine what will happen when toggled
+      # ANSI color codes: cyan for flag, green/red for values, yellow for context/env
+      cyan = "\033[36m"
+      green = "\033[32m"
+      red = "\033[31m"
+      yellow = "\033[33m"
+      reset = "\033[0m"
+
+      if user_value.nil?
+        new_value = !default_value
+        value_color = new_value ? green : red
+        value_text = new_value ? 'true' : 'false'
+        action = "Set #{cyan}#{flag['key']}#{reset} to #{value_color}#{value_text}#{reset} for #{yellow}#{@context_key}#{reset} in #{yellow}#{@environment}#{reset}"
+      else
+        new_value = !user_value
+        if new_value == default_value
+          value_color = default_value ? green : red
+          value_text = default_value ? 'true' : 'false'
+          action = "Reset #{cyan}#{flag['key']}#{reset} to default (#{value_color}#{value_text}#{reset}) for #{yellow}#{@context_key}#{reset} in #{yellow}#{@environment}#{reset}"
+        else
+          value_color = new_value ? green : red
+          value_text = new_value ? 'true' : 'false'
+          action = "Set #{cyan}#{flag['key']}#{reset} to #{value_color}#{value_text}#{reset} for #{yellow}#{@context_key}#{reset} in #{yellow}#{@environment}#{reset}"
+        end
+      end
+
+      {
+        display: "#{user_status.ljust(7)} | default: #{default_status.ljust(5)} | #{flag['key']} - #{flag['name']}",
+        preview: action
+      }
+    end
+
+    fzf_input = flag_data.map { |d| d[:display] }.join("\n")
+    preview_data = flag_data.map { |d| d[:preview] }.join("\n")
+
+    # Create temporary files for fzf input and preview data
+    input_file = "/tmp/ld-toggle-input-#{Process.pid}.txt"
+    preview_file = "/tmp/ld-toggle-preview-#{Process.pid}.txt"
+    File.write(input_file, fzf_input)
+    File.write(preview_file, preview_data)
+
+    # Run fzf with preview window
+    # {n} is zero-based, so we need to add 1 for awk's 1-based line numbers
+    header = "#{'Current'.ljust(7)} | #{'Default'.ljust(14)} | Flag"
+    fzf_output = `cat #{input_file} | fzf --header="#{header}" --height=80% --layout=reverse --border --preview="awk 'NR=={n}+1' #{preview_file}" --preview-window=down:1:wrap`
+
+    File.delete(input_file) if File.exist?(input_file)
+    File.delete(preview_file) if File.exist?(preview_file)
+
+    if fzf_output.empty?
+      puts "No flag selected."
+      return
+    end
+
+    # Parse selected flag
+    flag_key = fzf_output.strip.split('|')[2].strip.split(' - ')[0]
+
+    # Toggle the selected flag
+    toggle_flag(flag_key, flags)
+  end
+
+  def fetch_flags
+    all_flags = []
+    offset = 0
+    limit = 100  # Increased from 50 to reduce number of requests
+
+    loop do
+      result = run_ldcli_json(
+        'flags', 'list',
+        '--project', @project_key,
+        '--env', @environment,  # Include environment details in response
+        '--summary', '0',  # Include targets, rules, and prerequisites
+        '--sort', '-creationDate',  # Sort by newest first (matches web UI)
+        '--limit', limit.to_s,
+        '--offset', offset.to_s,
+        '--output', 'json'
+      )
+
+      break if result.nil? || result['items'].nil? || result['items'].empty?
+
+      all_flags.concat(result['items'])
+      offset += result['items'].length
+
+      # Check if we've fetched all flags
+      total_count = result['totalCount']
+      break if total_count && all_flags.length >= total_count
+    end
+
+    # Filter to only boolean flags
+    all_flags.select do |flag|
+      flag['variations']&.all? { |v| v['value'].is_a?(TrueClass) || v['value'].is_a?(FalseClass) }
+    end
+  end
+
+  def get_flag_value_for_context_from_flag(flag)
+    # Works with flags that already have environment details from list --env
+    env_config = flag['environments']&.fetch(@environment, nil)
+    return nil if env_config.nil?
+
+    # Check if context is individually targeted
+    if env_config['targets']
+      env_config['targets'].each do |target|
+        if target['values']&.include?(@context_key) && target['contextKind'] == @context_kind
+          variation_index = target['variation']
+          variation = flag['variations'][variation_index]
+          return variation['value'] if variation
+        end
+      end
+    end
+
+    # Return nil to indicate using default
+    nil
+  end
+
+  def get_default_value_from_flag(flag)
+    # Works with flags that already have environment details from list --env
+    env_config = flag['environments']&.fetch(@environment, nil)
+    return false if env_config.nil?
+
+    # Get fallthrough variation
+    fallthrough_variation_index = env_config.dig('fallthrough', 'variation')
+    return false if fallthrough_variation_index.nil?
+
+    variation = flag['variations'][fallthrough_variation_index]
+    variation ? variation['value'] : false
+  end
+
+  def get_flag_value_for_context_from_full_flag(full_flag)
+    # Works with full_flag from flags get
+    # Note: targets use variation INDEX, not ID
+    return nil if full_flag.nil?
+
+    env_config = full_flag['environments'][@environment]
+    return nil if env_config.nil?
+
+    # Check if context is individually targeted
+    if env_config['targets']
+      env_config['targets'].each do |target|
+        if target['values']&.include?(@context_key) && target['contextKind'] == @context_kind
+          variation_index = target['variation']
+          variation = full_flag['variations'][variation_index]
+          return variation['value'] if variation
+        end
+      end
+    end
+
+    # Return nil to indicate using default
+    nil
+  end
+
+  def get_default_value_from_full_flag(full_flag)
+    # Works with full_flag from flags get
+    # Note: fallthrough uses variation INDEX, not ID
+    return false if full_flag.nil?
+
+    env_config = full_flag['environments'][@environment]
+    return false if env_config.nil?
+
+    # Get fallthrough variation (this is an index)
+    fallthrough_variation_index = env_config.dig('fallthrough', 'variation')
+    return false if fallthrough_variation_index.nil?
+
+    variation = full_flag['variations'][fallthrough_variation_index]
+    variation ? variation['value'] : false
+  end
+
+  def toggle_flag(flag_key, flags)
+    flag = flags.find { |f| f['key'] == flag_key }
+    return unless flag
+
+    # Get full flag details
+    full_flag = run_ldcli_json(
+      'flags', 'get',
+      '--project', @project_key,
+      '--flag', flag_key,
+      '--env', @environment,
+      '--output', 'json'
+    )
+
+    # Get current value and default from the fresh full_flag data
+    current_value = get_flag_value_for_context_from_full_flag(full_flag)
+    default_value = get_default_value_from_full_flag(full_flag)
+
+    # Determine what action to take
+    if current_value.nil?
+      # Currently using default, so toggle to opposite
+      new_value = !default_value
+    else
+      # Currently overridden, toggle to opposite
+      new_value = !current_value
+    end
+
+    # Perform the toggle
+    if new_value == default_value && !current_value.nil?
+      # Remove individual targeting (reset to default)
+      remove_individual_targeting(flag_key, full_flag)
+    else
+      # Add individual targeting
+      add_individual_targeting(flag_key, full_flag, new_value)
+    end
+  end
+
+  def add_individual_targeting(flag_key, full_flag, value)
+    # Find the variation ID for the desired value
+    variation = full_flag['variations'].find { |v| v['value'] == value }
+
+    unless variation
+      puts "Error: Could not find variation for value #{value}"
+      return
+    end
+
+    # Build instructions to remove from all other variations and add to target
+    instructions = []
+
+    # Remove from all other variations
+    full_flag['variations'].each do |var|
+      next if var['_id'] == variation['_id']
+      instructions << {
+        'kind' => 'removeTargets',
+        'values' => [@context_key],
+        'variationId' => var['_id'],
+        'contextKind' => @context_kind
+      }
+    end
+
+    # Add to the target variation
+    instructions << {
+      'kind' => 'addTargets',
+      'values' => [@context_key],
+      'variationId' => variation['_id'],
+      'contextKind' => @context_kind
+    }
+
+    instruction = {
+      'environmentKey' => @environment,
+      'instructions' => instructions
+    }
+
+    result = run_ldcli(
+      'flags', 'update',
+      '--project', @project_key,
+      '--flag', flag_key,
+      '--semantic-patch',
+      '--data', instruction.to_json
+    )
+
+    if result
+      puts "✓ #{flag_key} set to #{value} for #{@context_key}"
+    else
+      puts "✗ Failed to update #{flag_key}"
+    end
+  end
+
+  def remove_individual_targeting(flag_key, full_flag)
+    # Remove context from all variations
+    instructions = full_flag['variations'].map do |variation|
+      {
+        'kind' => 'removeTargets',
+        'values' => [@context_key],
+        'variationId' => variation['_id'],
+        'contextKind' => @context_kind
+      }
+    end
+
+    instruction = {
+      'environmentKey' => @environment,
+      'instructions' => instructions
+    }
+
+    result = run_ldcli(
+      'flags', 'update',
+      '--project', @project_key,
+      '--flag', flag_key,
+      '--semantic-patch',
+      '--data', instruction.to_json
+    )
+
+    if result
+      puts "✓ #{flag_key} reset to default for #{@context_key}"
+    else
+      puts "✗ Failed to reset #{flag_key}"
+    end
+  end
+
+  def remove_from_variation(flag_key, variation_id)
+    instruction = {
+      'environmentKey' => @environment,
+      'instructions' => [
+        {
+          'kind' => 'removeTargets',
+          'values' => [@context_key],
+          'variationId' => variation_id,
+          'contextKind' => @context_kind
+        }
+      ]
+    }
+
+    run_ldcli(
+      'flags', 'update',
+      '--project', @project_key,
+      '--flag', flag_key,
+      '--semantic-patch',
+      '--data', instruction.to_json
+    )
+  end
+
+  def run_ldcli(*args)
+    require 'open3'
+    cmd = ['ldcli'] + args
+
+    # Use Open3 to suppress stderr noise from ldcli
+    stdout, stderr, status = Open3.capture3(*cmd)
+
+    # Print stdout (success messages)
+    print stdout unless stdout.empty?
+
+    # Only print stderr if the command actually failed
+    if !status.success? && !stderr.empty?
+      puts stderr
+    end
+
+    status.success?
+  end
+
+  def run_ldcli_json(*args)
+    require 'open3'
+    cmd = ['ldcli', '--output', 'json'] + args
+
+    # Use Open3 to properly handle arguments without shell interpretation
+    stdout, stderr, status = Open3.capture3(*cmd)
+
+    return nil if stdout.empty?
+
+    JSON.parse(stdout)
+  rescue JSON::ParserError => e
+    puts "Error parsing JSON from ldcli: #{e.message}"
+    puts "stderr: #{stderr}" if stderr && !stderr.empty?
+    nil
+  end
+end
+
+# Run the tool
+if __FILE__ == $0
+  LDToggle.new.run
+end

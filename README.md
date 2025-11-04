@@ -5,10 +5,11 @@ A CLI utility for toggling LaunchDarkly feature flags for specific users/context
 ## Features
 
 - Interactive fzf-based interface for browsing and toggling feature flags
-- Individual user targeting (doesn't affect other users)
+- Individual user and driver targeting (doesn't affect other users/drivers)
 - Support for multiple environments (development, staging, production)
-- Persistent configuration for project and user contexts
-- Shows both current user-specific value and default value for each flag
+- Persistent configuration for project and user/driver contexts
+- Shows both current context-specific value and default value for each flag
+- Automatic UUID to ULID conversion for driver contexts
 - Only supports boolean feature flags
 
 ## Prerequisites
@@ -75,7 +76,8 @@ ld-toggle --env production
 
 - `--env ENVIRONMENT` - Specify environment (development, staging, production). Default: development
 - `--project PROJECT_KEY` - Override the default project key
-- `--reconfigure` - Reconfigure the user context for the current environment
+- `--reconfigure` - Reconfigure the user/driver context for the current environment
+- `-d, --driver [KEY]` - Toggle flags for a driver context. Optionally provide driver UUID/ULID
 - `-h, --help` - Show help message
 
 ### Interactive Interface
@@ -125,6 +127,16 @@ The tool stores configuration in `$XDG_CONFIG_HOME/ld-toggle/config.json` (or `~
       "key": "auth0|user-key-789",
       "kind": "user"
     }
+  },
+  "driver_contexts": {
+    "development": {
+      "key": "01HZQK7XVZQD6XGZQK7XVZQK7X",
+      "kind": "driver"
+    },
+    "staging": {
+      "key": "01HZQK8YVZQD6XGZQK8YVZQK8Y",
+      "kind": "driver"
+    }
   }
 }
 ```
@@ -169,13 +181,46 @@ $ ld-toggle --project another-project --env staging
 [... works with different project ...]
 ```
 
+### Scenario 5: Toggling driver context (interactive)
+
+```bash
+$ ld-toggle --driver
+Enter driver UUID or ULID: 550e8400-e29b-41d4-a716-446655440000
+Driver context found!
+Driver context configured: 2N1T201RMV87AAE5J4CSAM8000 (kind: driver) for development
+Loading feature flags...
+[fzf interface appears]
+```
+
+### Scenario 6: Toggling driver context (with key)
+
+```bash
+# Using UUID (automatically converted to ULID)
+$ ld-toggle --driver 550e8400-e29b-41d4-a716-446655440000
+
+# Using ULID directly
+$ ld-toggle --driver 01HZQK7XVZQD6XGZQK7XVZQK7X
+
+# With different environment
+$ ld-toggle --driver 01HZQK8YVZQD6XGZQK8YVZQK8Y --env staging
+```
+
+### Scenario 7: Reconfiguring driver context
+
+```bash
+$ ld-toggle --driver --reconfigure
+Enter driver UUID or ULID: [new driver UUID]
+[... new driver context setup ...]
+```
+
 ## How It Works
 
-1. **Configuration**: Stores project key and user context per environment
-2. **Flag Listing**: Uses `ldcli flags list` to fetch all boolean flags
-3. **Flag Evaluation**: Uses `ldcli flags get` to check individual targeting
-4. **Display**: Shows both user-specific value and default in fzf
-5. **Toggling**: Uses `ldcli flags update` with `addTargets`/`removeTargets` instructions
+1. **Configuration**: Stores project key and user/driver contexts per environment
+2. **UUID/ULID Conversion**: Automatically converts driver UUIDs to ULIDs using Crockford Base32 encoding
+3. **Flag Listing**: Uses `ldcli flags list` to fetch all boolean flags
+4. **Flag Evaluation**: Uses `ldcli flags get` to check individual targeting
+5. **Display**: Shows both context-specific value and default in fzf
+6. **Toggling**: Uses `ldcli flags update` with `addTargets`/`removeTargets` instructions
 
 ## Troubleshooting
 
@@ -201,6 +246,13 @@ The email search uses exact match. Make sure:
 - The user exists in the specified environment
 - You have access to view contexts in that environment
 
+### Driver context not found
+
+If you get an error when configuring a driver context:
+- Verify the driver UUID/ULID is correct
+- Ensure the driver context exists in the specified environment
+- Check that you have permissions to view driver contexts
+
 ### Authentication issues
 
 Make sure ldcli is configured with a valid access token:
@@ -215,10 +267,20 @@ Make sure your API token has the following permissions:
 - Update flags
 - Read contexts
 
+## Driver Context Support
+
+The tool supports both user and driver contexts:
+
+- **User contexts**: Configured via email search or direct key entry
+- **Driver contexts**: Configured via UUID/ULID entry
+- **UUID to ULID conversion**: Automatically converts driver UUIDs to ULIDs for compatibility
+
+Driver IDs are stored internally as UUIDs but presented as ULIDs. The tool handles this conversion automatically using Crockford Base32 encoding, matching the format used in the LaunchDarkly application.
+
 ## Limitations
 
 - Only supports boolean feature flags (flags with true/false variations)
-- Only supports user/context targeting (not rules or segments)
+- Only supports user/driver context targeting (not rules or segments)
 - Requires ldcli to be configured with appropriate permissions
 
 ## Contributing

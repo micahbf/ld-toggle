@@ -14,7 +14,9 @@ class LDToggle
     @options = {
       env: 'development',
       project: nil,
-      reconfigure: false
+      reconfigure: false,
+      driver: false,
+      driver_key: nil
     }
     parse_arguments
     @config = load_config
@@ -44,6 +46,11 @@ class LDToggle
 
       opts.on("--reconfigure", "Reconfigure context for current environment") do
         @options[:reconfigure] = true
+      end
+
+      opts.on("-d", "--driver [KEY]", "Toggle flags for a driver context. Optionally provide driver key.") do |key|
+        @options[:driver] = true
+        @options[:driver_key] = key
       end
 
       opts.on("-h", "--help", "Show this help message") do
@@ -88,20 +95,40 @@ class LDToggle
   end
 
   def ensure_context_configured
-    @config['contexts'] ||= {}
+    # Determine if we're working with driver or user contexts
+    if @options[:driver]
+      @config['driver_contexts'] ||= {}
+      context_storage_key = 'driver_contexts'
+      @context_kind = 'driver'
+    else
+      @config['contexts'] ||= {}
+      context_storage_key = 'contexts'
+      @context_kind = 'user'
+    end
 
-    if @options[:reconfigure] || !@config['contexts'][@environment]
+    # Check if explicit key was provided with --driver
+    if @options[:driver] && @options[:driver_key]
+      @context_key = @options[:driver_key]
+      # Convert UUID to ULID if necessary
+      @context_key = uuid_to_ulid(@context_key) if looks_like_uuid?(@context_key)
+      # Verify context exists
+      verify_and_save_driver_context(@context_key)
+      return
+    end
+
+    # Check if context is configured for this environment
+    if @options[:reconfigure] || !@config[context_storage_key][@environment]
       configure_context
     end
 
     # Handle both old format (string) and new format (hash with key/kind)
-    context_config = @config['contexts'][@environment]
+    context_config = @config[context_storage_key][@environment]
     if context_config.is_a?(String)
       @context_key = context_config
-      @context_kind = 'user'
+      # Context kind was already set above based on driver mode
     elsif context_config.is_a?(Hash)
       @context_key = context_config['key']
-      @context_kind = context_config['kind'] || 'user'
+      @context_kind = context_config['kind'] || @context_kind
     else
       configure_context
       return
@@ -113,6 +140,12 @@ class LDToggle
   end
 
   def configure_context
+    # Handle driver contexts differently
+    if @options[:driver]
+      configure_driver_context
+      return
+    end
+
     print "Enter user email to search: "
     email = gets.chomp.strip
 
@@ -203,6 +236,49 @@ class LDToggle
     save_config
 
     puts "Context configured: #{@context_key} (kind: #{@context_kind}) for #{@environment}"
+  end
+
+  def configure_driver_context
+    print "Enter driver UUID or ULID: "
+    driver_key = gets.chomp.strip
+
+    if driver_key.nil? || driver_key.empty?
+      abort "Driver UUID/ULID cannot be empty"
+    end
+
+    # Convert UUID to ULID if necessary
+    driver_key = uuid_to_ulid(driver_key) if looks_like_uuid?(driver_key)
+
+    verify_and_save_driver_context(driver_key)
+  end
+
+  def verify_and_save_driver_context(driver_key)
+    # Retrieve the context directly by kind and key (no search needed)
+    result = run_ldcli_json(
+      'contexts', 'list',
+      '--project', @project_key,
+      '--environment', @environment,
+      '--kind', 'driver',
+      '--key', driver_key,
+      '--output', 'json'
+    )
+
+    if result.nil? || result['items'].nil? || result['items'].empty?
+      puts "Warning: Could not verify driver context exists, but saving anyway..."
+    else
+      puts "Driver context found!"
+    end
+
+    @context_key = driver_key
+    @context_kind = 'driver'
+    @config['driver_contexts'] ||= {}
+    @config['driver_contexts'][@environment] = {
+      'key' => @context_key,
+      'kind' => @context_kind
+    }
+    save_config
+
+    puts "Driver context configured: #{@context_key} (kind: #{@context_kind}) for #{@environment}"
   end
 
   def search_contexts_by_email(email)
@@ -548,6 +624,30 @@ class LDToggle
       '--semantic-patch',
       '--data', instruction.to_json
     )
+  end
+
+  def looks_like_uuid?(str)
+    # UUID format: 8-4-4-4-12 hex characters
+    str.match?(/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i)
+  end
+
+  def uuid_to_ulid(uuid)
+    # Convert UUID to ULID using Crockford Base32 encoding
+    sanitized = uuid.delete("-").hex
+    encode_base32_crockford(sanitized).rjust(26, "0")
+  end
+
+  def encode_base32_crockford(num)
+    # Crockford Base32 alphabet (excludes I, L, O, U to avoid confusion)
+    alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    return "0" if num == 0
+
+    result = ""
+    while num > 0
+      result = alphabet[num % 32] + result
+      num /= 32
+    end
+    result
   end
 
   def run_ldcli(*args)

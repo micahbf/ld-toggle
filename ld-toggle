@@ -419,7 +419,18 @@ class LDToggle
     env_config = flag['environments']&.fetch(@environment, nil)
     return nil if env_config.nil?
 
-    # Check if context is individually targeted
+    # Check contextTargets first (new format for all context kinds)
+    if env_config['contextTargets']
+      env_config['contextTargets'].each do |target|
+        if target['values']&.include?(@context_key) && target['contextKind'] == @context_kind
+          variation_index = target['variation']
+          variation = flag['variations'][variation_index]
+          return variation['value'] if variation
+        end
+      end
+    end
+
+    # Fall back to legacy targets array for backwards compatibility
     if env_config['targets']
       env_config['targets'].each do |target|
         if target['values']&.include?(@context_key) && target['contextKind'] == @context_kind
@@ -455,7 +466,18 @@ class LDToggle
     env_config = full_flag['environments'][@environment]
     return nil if env_config.nil?
 
-    # Check if context is individually targeted
+    # Check contextTargets first (new format for all context kinds)
+    if env_config['contextTargets']
+      env_config['contextTargets'].each do |target|
+        if target['values']&.include?(@context_key) && target['contextKind'] == @context_kind
+          variation_index = target['variation']
+          variation = full_flag['variations'][variation_index]
+          return variation['value'] if variation
+        end
+      end
+    end
+
+    # Fall back to legacy targets array for backwards compatibility
     if env_config['targets']
       env_config['targets'].each do |target|
         if target['values']&.include?(@context_key) && target['contextKind'] == @context_kind
